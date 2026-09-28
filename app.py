@@ -66,157 +66,212 @@ def enrich(df):
     x["rvol"]=x.volume/x.vol_ma20.replace(0,np.nan)
     return x
 
-def find_sr_zones(df, lookback=220, max_each=3, min_gap_pct=0.02):
+def find_sr_zones(df, lookback=260, max_each=3, min_gap_pct=0.02):
     """
-    Build meaningful support/resistance zones from confirmed pivots.
-    A retest counts only after price leaves the zone and later returns.
-    Micro-levels are filtered; nearest opposite zones must be >= min_gap_pct apart.
+    Classical S/R engine:
+    - confirmed swing highs/lows
+    - clusters nearby pivots into zones
+    - a retest counts only after price clearly leaves and comes back
+    - rewards rejection quality, volume, recency and role-reversal
+    - penalizes repeated hammering, clean breaks and stale levels
     """
     x = df.tail(min(lookback, len(df))).copy().reset_index(drop=True)
-    if len(x) < 40:
+    if len(x) < 60:
         return [], []
 
     current = float(x.close.iloc[-1])
-    atr_series = atr(x, 14)
-    atr_now = float(atr_series.iloc[-1])
-    if not np.isfinite(atr_now) or atr_now <= 0:
+    atr_s = atr(x, 14).replace([np.inf, -np.inf], np.nan)
+    atr_now = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else current * 0.02
+    if atr_now <= 0:
         atr_now = current * 0.02
 
-    # Zone width adapts to volatility, but remains a zone rather than a single tick.
-    half_width = max(current * 0.004, atr_now * 0.28)
-    half_width = min(half_width, current * 0.018)
+    # Zone width: volatility-aware, but not so wide that it becomes useless.
+    half_width = np.clip(atr_now * 0.24, current * 0.0035, current * 0.012)
 
+    vol_ma = x.volume.rolling(20, min_periods=5).mean().replace(0, np.nan)
     pivots = []
-    # Wider 7-bar pivot confirmation removes a lot of intraday/noisy swings.
-    for i in range(3, len(x)-3):
+    wing = 4  # 9-candle confirmed swing: filters minor noise
+
+    for i in range(wing, len(x) - wing):
         lo = float(x.low.iloc[i]); hi = float(x.high.iloc[i])
-        local_low = float(x.low.iloc[i-3:i+4].min())
-        local_high = float(x.high.iloc[i-3:i+4].max())
-        if lo <= local_low:
-            pivots.append({"price":lo, "idx":i, "kind":"L", "vol":float(x.volume.iloc[i] or 0)})
-        if hi >= local_high:
-            pivots.append({"price":hi, "idx":i, "kind":"H", "vol":float(x.volume.iloc[i] or 0)})
+        local_lows = x.low.iloc[i-wing:i+wing+1]
+        local_highs = x.high.iloc[i-wing:i+wing+1]
+        a = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else atr_now
+
+        # Require some prominence versus nearby bars, not merely equal local extreme.
+        low_prom = float(local_lows.drop(index=i).min()) - lo
+        high_prom = hi - float(local_highs.drop(index=i).max())
+
+        if lo <= float(local_lows.min()) and low_prom >= -0.12 * a:
+            pivots.append({"price": lo, "idx": i, "kind": "L"})
+        if hi >= float(local_highs.max()) and high_prom >= -0.12 * a:
+            pivots.append({"price": hi, "idx": i, "kind": "H"})
 
     if not pivots:
         return [], []
 
-    # Price clustering.
-    pivots.sort(key=lambda q: q["price"])
+    # Cluster pivots by ATR/price distance.
+    pivots.sort(key=lambda p: p["price"])
+    merge_dist = max(half_width * 1.55, current * 0.006)
     clusters = []
-    merge_dist = max(half_width * 1.75, current * 0.0075)
-    for q in pivots:
-        candidates = [c for c in clusters if abs(q["price"]-c["center"]) <= merge_dist]
-        if not candidates:
-            clusters.append({"prices":[q["price"]], "idxs":[q["idx"]], "vols":[q["vol"]],
-                             "kinds":[q["kind"]], "center":q["price"]})
+    for p in pivots:
+        matches = [c for c in clusters if abs(p["price"] - c["center"]) <= merge_dist]
+        if not matches:
+            clusters.append({"members": [p], "center": p["price"]})
         else:
-            c = min(candidates, key=lambda z: abs(q["price"]-z["center"]))
-            c["prices"].append(q["price"]); c["idxs"].append(q["idx"])
-            c["vols"].append(q["vol"]); c["kinds"].append(q["kind"])
-            c["center"] = float(np.median(c["prices"]))
+            c = min(matches, key=lambda q: abs(p["price"] - q["center"]))
+            c["members"].append(p)
+            c["center"] = float(np.median([m["price"] for m in c["members"]]))
 
-    avg_vol = float(x.volume.replace(0, np.nan).mean())
-    if not np.isfinite(avg_vol) or avg_vol <= 0:
-        avg_vol = 1.0
-
-    ranked = []
+    zones = []
     n = len(x)
-    for c in clusters:
-        center = c["center"]
-        low, high = center-half_width, center+half_width
 
-        # True tests: price must leave by a buffer before a new return is counted.
-        tests = []
+    for c in clusters:
+        center = float(c["center"])
+        low, high = center - half_width, center + half_width
+        leave_buffer = half_width + max(atr_now * 0.45, current * 0.005)
+
+        # Genuine visits: once inside, price must leave decisively before another visit counts.
+        visits = []
         armed = True
-        leave_buffer = half_width + max(atr_now * 0.35, current * 0.004)
         for i in range(n):
-            intersects = float(x.low.iloc[i]) <= high and float(x.high.iloc[i]) >= low
-            if intersects and armed:
-                tests.append(i)
+            inside = float(x.low.iloc[i]) <= high and float(x.high.iloc[i]) >= low
+            if inside and armed:
+                visits.append(i)
                 armed = False
             elif not armed:
-                far = (float(x.low.iloc[i]) > center + leave_buffer or
-                       float(x.high.iloc[i]) < center - leave_buffer)
-                if far:
+                clearly_above = float(x.low.iloc[i]) > center + leave_buffer
+                clearly_below = float(x.high.iloc[i]) < center - leave_buffer
+                if clearly_above or clearly_below:
                     armed = True
 
-        # Reaction after pivot: move away within 5 candles, normalized by ATR at that time.
-        reactions = []
-        for i in c["idxs"]:
-            if i+5 < n:
-                local_atr = float(atr_series.iloc[i])
-                if not np.isfinite(local_atr) or local_atr <= 0:
-                    local_atr = atr_now
-                if c["kinds"][c["idxs"].index(i)] == "L":
-                    move = float(x.high.iloc[i+1:i+6].max()) - center
-                else:
-                    move = center - float(x.low.iloc[i+1:i+6].min())
-                reactions.append(max(0.0, move) / max(local_atr, 1e-9))
-
-        reaction = float(np.mean(reactions)) if reactions else 0.0
-        recency = max(c["idxs"]) / max(n-1, 1)
-        vol_ratio = float(np.mean(c["vols"]) / avg_vol) if c["vols"] else 1.0
-        true_tests = len(tests)
-
-        # Require evidence: at least 2 genuine tests, or a very strong repeated pivot cluster.
-        if true_tests < 2 and len(c["idxs"]) < 3:
+        if len(visits) < 2:
             continue
-        if reaction < 0.55:
+
+        # Compress visits that are too close in time: same battle != many independent tests.
+        independent = []
+        for i in visits:
+            if not independent or i - independent[-1] >= 6:
+                independent.append(i)
+        visits = independent
+        if len(visits) < 2:
             continue
+
+        reactions, vol_confirm, clean_breaks, side_history = [], [], 0, []
+        for i in visits:
+            a = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else atr_now
+            before = float(x.close.iloc[max(0, i-1)])
+            side = "above" if before > center else "below"
+            side_history.append(side)
+
+            future = x.iloc[i+1:min(n, i+7)]
+            if future.empty:
+                continue
+
+            # Best rejection away from zone over the next six candles.
+            up_move = max(0.0, float(future.high.max()) - high)
+            down_move = max(0.0, low - float(future.low.min()))
+            if side == "above":       # support test
+                move = up_move
+            else:                     # resistance test
+                move = down_move
+            reactions.append(move / max(a, 1e-9))
+
+            base_vol = float(vol_ma.iloc[i]) if pd.notna(vol_ma.iloc[i]) else np.nan
+            vr = float(x.volume.iloc[i]) / base_vol if np.isfinite(base_vol) and base_vol > 0 else 1.0
+            vol_confirm.append(vr)
+
+            # A decisive close through the zone with range expansion weakens it.
+            candle_range = float(x.high.iloc[i] - x.low.iloc[i])
+            if side == "above" and float(x.close.iloc[i]) < low - 0.20*a and candle_range > 1.05*a:
+                clean_breaks += 1
+            if side == "below" and float(x.close.iloc[i]) > high + 0.20*a and candle_range > 1.05*a:
+                clean_breaks += 1
+
+        if not reactions:
+            continue
+
+        reaction_med = float(np.median(reactions))
+        strong_rejections = sum(r >= 0.8 for r in reactions)
+        vol_med = float(np.median(vol_confirm)) if vol_confirm else 1.0
+
+        # Classical role reversal: same zone acted from both sides at different times.
+        role_reversal = len(set(side_history)) > 1
+
+        # Recency decays smoothly; old levels can survive if reactions were exceptional.
+        last_visit = max(visits)
+        age = (n - 1 - last_visit)
+        recency = float(np.exp(-age / 85.0))
+
+        # Repeated tests are useful initially, then become "hammering" and weaken the level.
+        test_score = {2: 2.2, 3: 3.2, 4: 3.7}.get(len(visits), 3.7)
+        hammer_penalty = max(0, len(visits) - 4) * 0.75
 
         raw = (
-            min(true_tests, 4) * 2.0 +
-            min(len(c["idxs"]), 5) * 0.65 +
-            min(reaction, 3.0) * 1.15 +
-            min(vol_ratio, 2.0) * 0.65 +
-            recency * 1.15
+            test_score
+            + min(reaction_med, 2.5) * 2.15
+            + min(strong_rejections, 3) * 0.65
+            + np.clip(vol_med - 0.8, 0, 1.2) * 1.10
+            + recency * 1.65
+            + (1.0 if role_reversal else 0.0)
+            - clean_breaks * 1.35
+            - hammer_penalty
         )
-        strength = int(np.clip(round(raw / 2.6), 1, 5))
-        ranked.append({
-            "center":center, "low":low, "high":high,
-            "touches":true_tests, "strength":strength,
-            "reaction":reaction, "raw":raw
+
+        # Reject weak "levels" even if they accumulated touches.
+        if reaction_med < 0.55 or raw < 6.0:
+            continue
+
+        if raw >= 10.5:
+            strength, grade = 5, "قوية جدًا"
+        elif raw >= 8.7:
+            strength, grade = 4, "قوية"
+        elif raw >= 7.2:
+            strength, grade = 3, "جيدة"
+        else:
+            strength, grade = 2, "متوسطة"
+
+        zones.append({
+            "center": center, "low": low, "high": high,
+            "touches": len(visits), "strength": strength, "grade": grade,
+            "reaction": reaction_med, "volume_confirm": vol_med,
+            "role_reversal": role_reversal, "breaks": clean_breaks,
+            "recency": recency, "raw": float(raw)
         })
 
-    supports = [z for z in ranked if z["high"] < current]
-    resistances = [z for z in ranked if z["low"] > current]
+    # A zone may be support or resistance according to CURRENT price.
+    supports = [z for z in zones if z["high"] < current]
+    resistances = [z for z in zones if z["low"] > current]
 
-    # Remove nearly duplicate zones within the same side, keeping the stronger one.
+    # Same-side separation: don't show several versions of essentially one level.
     def dedupe(items):
         items = sorted(items, key=lambda z: z["raw"], reverse=True)
         kept = []
         for z in items:
-            if all(abs(z["center"]-k["center"]) / current >= 0.018 for k in kept):
+            sep = max(0.018, min_gap_pct * 0.85)
+            if all(abs(z["center"] - k["center"]) / current >= sep for k in kept):
                 kept.append(z)
         return kept
 
-    supports = dedupe(supports)
-    resistances = dedupe(resistances)
+    supports, resistances = dedupe(supports), dedupe(resistances)
 
-    # Prefer relevant zones: strength first, but penalize extremely distant history.
+    # Relevance = quality with a modest distance penalty; avoids ancient faraway levels dominating.
     for z in supports + resistances:
-        dist = abs(z["center"]-current) / current
-        z["rank_score"] = z["raw"] - max(0, dist-0.12)*8
+        dist = abs(z["center"] - current) / current
+        z["rank_score"] = z["raw"] - max(0.0, dist - 0.10) * 10.0
 
-    supports = sorted(supports, key=lambda z: z["rank_score"], reverse=True)
-    resistances = sorted(resistances, key=lambda z: z["rank_score"], reverse=True)
-
-    # Ensure the nearest displayed support/resistance are meaningfully separated.
-    # We target at least 2%; if a pair is too tight, drop the weaker micro-zone.
-    changed = True
-    while supports and resistances and changed:
-        changed = False
+    # Enforce meaningful open space between nearest support and resistance.
+    while supports and resistances:
         s = max(supports, key=lambda z: z["center"])
         r = min(resistances, key=lambda z: z["center"])
-        gap = (r["low"] - s["high"]) / max((r["low"] + s["high"])/2, 1e-9)
-        if gap < min_gap_pct:
-            if s["raw"] <= r["raw"]:
-                supports.remove(s)
-            else:
-                resistances.remove(r)
-            changed = True
+        gap = (r["low"] - s["high"]) / max((r["low"] + s["high"]) / 2, 1e-9)
+        if gap >= min_gap_pct:
+            break
+        if s["rank_score"] <= r["rank_score"]:
+            supports.remove(s)
+        else:
+            resistances.remove(r)
 
-    # Final display: nearest meaningful zones first.
     supports = sorted(supports, key=lambda z: z["center"], reverse=True)[:max_each]
     resistances = sorted(resistances, key=lambda z: z["center"])[:max_each]
     return supports, resistances
@@ -247,18 +302,20 @@ def score_frame(df):
     score+=vs; details["Volume"]=vs
     supports,resistances=find_sr_zones(x, min_gap_pct=0.02)
     p=float(z.close); atr_now=max(float(z.atr), p*0.005)
-    sr=0
+    sr=0.0
     if supports:
         s=supports[0]
         dist=max(0.0, (p-s["high"])/p)
-        if dist <= 0.012: sr += min(10, 2*s["strength"])
-        elif dist <= 0.03: sr += min(6, s["strength"])
+        quality=s["strength"] + (0.75 if s["role_reversal"] else 0)
+        if dist <= 0.015: sr += min(9.0, quality*1.55)
+        elif dist <= 0.04: sr += min(5.0, quality)
     if resistances:
         r=resistances[0]
         dist=max(0.0, (r["low"]-p)/p)
-        if dist <= 0.012: sr -= min(10, 2*r["strength"])
-        elif dist <= 0.03: sr -= min(6, r["strength"])
-    sr=int(np.clip(sr,-15,15))
+        quality=r["strength"] + (0.75 if r["role_reversal"] else 0)
+        if dist <= 0.015: sr -= min(9.0, quality*1.55)
+        elif dist <= 0.04: sr -= min(5.0, quality)
+    sr=int(round(np.clip(sr,-12,12)))
     score+=sr; details["S/R"]=sr
     atrpct=float(z.atr/z.close*100) if z.close else 0
     return round(max(-100,min(100,score))),details,supports,resistances,rv,rvol,atrpct,x
@@ -279,7 +336,7 @@ if not API_KEY:
 
 c1,c2=st.columns([2,1])
 symbol=c1.text_input("رمز السهم","CRWV").upper().strip()
-tf=c2.selectbox("الفريم الرئيسي",list(INTERVALS.keys()),index=1)
+tf=c2.selectbox("الفريم الرئيسي",list(INTERVALS.keys()),index=3)
 
 if st.button("تحليل",type="primary",use_container_width=True):
     try:
@@ -328,20 +385,32 @@ if st.button("تحليل",type="primary",use_container_width=True):
 
         st.subheader("مناطق الدعم والمقاومة")
         left,right=st.columns(2)
+
+        def zone_line(i, zz, side):
+            dist = ((price - zz["high"]) / price * 100) if side == "S" else ((zz["low"] - price) / price * 100)
+            rr = " • تبادل أدوار" if zz["role_reversal"] else ""
+            return (
+                f"**{i}. {zone_text(zz)}** — {zz['grade']}  "
+                f"({'★'*zz['strength']}{'☆'*(5-zz['strength'])})  \\n"
+                f"اختبارات مستقلة: {zz['touches']} • ارتداد: {zz['reaction']:.1f} ATR "
+                f"• بُعد: {max(0,dist):.1f}%{rr}"
+            )
+
         with left:
             st.markdown("**🟢 الدعوم**")
             if supports:
                 for i,zz in enumerate(supports,1):
-                    st.write(f"{i}. {zone_text(zz)}  |  {'★'*zz['strength']}{'☆'*(5-zz['strength'])}  |  اختبارات حقيقية: {zz['touches']}")
+                    st.markdown(zone_line(i,zz,"S"))
             else:
-                st.write("لا توجد منطقة دعم موثوقة ضمن النطاق المحلل.")
+                st.write("لا يوجد دعم كلاسيكي موثوق قريب ضمن البيانات الحالية.")
+
         with right:
             st.markdown("**🔴 المقاومات**")
             if resistances:
                 for i,zz in enumerate(resistances,1):
-                    st.write(f"{i}. {zone_text(zz)}  |  {'★'*zz['strength']}{'☆'*(5-zz['strength'])}  |  اختبارات حقيقية: {zz['touches']}")
+                    st.markdown(zone_line(i,zz,"R"))
             else:
-                st.write("لا توجد منطقة مقاومة موثوقة ضمن النطاق المحلل.")
+                st.write("لا توجد مقاومة كلاسيكية موثوقة قريبة ضمن البيانات الحالية.")
 
         g,h=st.columns(2)
         g.metric("RSI",f"{rv:.1f}")
@@ -352,7 +421,7 @@ if st.button("تحليل",type="primary",use_container_width=True):
             st.caption(f"ATR = {atrpct:.2f}% من السعر | آخر شمعة: {stamp} بتوقيت نيويورك")
             st.caption("Score يقيس اتفاق الإشارات الفنية، وليس نسبة احتمال مؤكدة.")
 
-        st.info("المناطق المعروضة تُفلتر المستويات اللحظية: الاختبار الجديد لا يُحسب إلا بعد ابتعاد السعر ثم عودته، وتُراعى قوة الارتداد والحجم والحداثة وATR. كما تُستبعد المناطق المتقاربة جدًا، مع حد أدنى مستهدف 2% بين أقرب دعم ومقاومة.")
+        st.info("المستويات هنا مناطق كلاسيكية وليست نقاطًا لحظية: تُبنى من Swing High/Low مؤكدة، ويُحسب الاختبار مرة جديدة فقط بعد ابتعاد السعر وعودته. القوة تعتمد على جودة الرفض السعري، استقلال الاختبارات، الحجم، الحداثة، تبادل الأدوار والكسر النظيف. كثرة اللمسات بعد حد معيّن تُضعف المستوى بدل أن ترفعه، وتُفلتر المناطق المتقاربة مع حد أدنى مستهدف 2% بين أقرب دعم ومقاومة.")
     except Exception as e:
         safe=str(e)
         if API_KEY: safe=safe.replace(API_KEY,"***")
